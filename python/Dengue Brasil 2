@@ -1,0 +1,603 @@
+# ============================================================
+# PROJETO: Análise Estatística Espacial da Dengue no Brasil
+# ANO: 2025
+# SCRIPT 02: Moran Global, ajuste para taxas, Bayes Empírico e LISA
+#
+# Requer a execução prévia de:
+#   01_baixar_agregar_dengue_2025.py
+#
+# Bibliotecas espaciais:
+#   - GeoPandas
+#   - libpysal
+#   - esda
+#
+# Observação:
+#   A implementação Python usa o ajuste de Assunção para taxas
+#   (assuncao_rate) antes do Moran global, que é a contraparte
+#   disponível no ecossistema PySAL para lidar com a heterogeneidade
+#   do denominador populacional.
+# ============================================================
+
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from esda import Moran, Moran_Local, Moran_Rate
+from esda.smoothing import (
+    Empirical_Bayes,
+    Spatial_Empirical_Bayes,
+    assuncao_rate,
+)
+from libpysal.weights import Queen
+from libpysal.weights.spatial_lag import lag_spatial
+from statsmodels.stats.multitest import multipletests
+
+
+# ------------------------------------------------------------
+# 0. Diretórios e arquivo de entrada
+# ------------------------------------------------------------
+
+DIR_PROCESSADOS = Path("dados_processados")
+DIR_RESULTADOS = Path("resultados")
+DIR_FIGURAS = Path("figuras")
+
+DIR_RESULTADOS.mkdir(parents=True, exist_ok=True)
+DIR_FIGURAS.mkdir(parents=True, exist_ok=True)
+
+ARQUIVO = (
+    DIR_PROCESSADOS
+    / "dengue_municipios_brasil_2025.parquet"
+)
+
+if not ARQUIVO.exists():
+    raise FileNotFoundError(
+        "Execute primeiro o script "
+        "01_baixar_agregar_dengue_2025.py."
+    )
+
+
+# ------------------------------------------------------------
+# 1. Carregar base espacial
+# ------------------------------------------------------------
+
+dengue = gpd.read_parquet(ARQUIVO)
+
+if not isinstance(dengue, gpd.GeoDataFrame):
+    raise TypeError(
+        "O arquivo carregado não é um GeoDataFrame."
+    )
+
+if len(dengue) != 5571:
+    warnings.warn(
+        "A análise esperava 5.571 municípios em 2025; "
+        f"foram encontrados {len(dengue)}."
+    )
+
+try:
+    dengue["geometry"] = dengue.geometry.make_valid()
+except AttributeError:
+    dengue["geometry"] = dengue.geometry.buffer(0)
+
+if (
+    dengue["populacao"].isna()
+    | dengue["populacao"].le(0)
+).any():
+    raise ValueError(
+        "Há população ausente ou não positiva."
+    )
+
+if dengue["incidencia_100mil"].isna().any():
+    raise ValueError(
+        "Há incidência ausente."
+    )
+
+if np.isclose(
+    dengue["incidencia_100mil"].std(ddof=1),
+    0,
+):
+    raise ValueError(
+        "A incidência não possui variabilidade."
+    )
+
+# Garantir índice sequencial para alinhamento com pesos.
+dengue = dengue.reset_index(drop=True)
+
+
+# ------------------------------------------------------------
+# 2. Vizinhança por contiguidade Queen
+# ------------------------------------------------------------
+
+w_full = Queen.from_dataframe(
+    dengue,
+    use_index=False,
+)
+
+n_vizinhos = np.array(
+    [len(w_full.neighbors[i]) for i in range(w_full.n)]
+)
+
+dengue["n_vizinhos"] = n_vizinhos
+
+islands = list(w_full.islands)
+
+isolados = dengue.loc[
+    dengue["n_vizinhos"].eq(0),
+    [
+        "code_muni",
+        "name_muni",
+        "abbrev_state",
+        "n_vizinhos",
+    ],
+].copy()
+
+isolados.to_csv(
+    DIR_RESULTADOS
+    / "municipios_sem_vizinhos_queen.csv",
+    index=False,
+    encoding="utf-8-sig",
+)
+
+print(
+    f"Municípios sem vizinhos Queen: {len(islands)}"
+)
+print(
+    f"Número de componentes da matriz: {w_full.n_components}"
+)
+
+# Para estatísticas globais/locais, reproduzimos a lógica de
+# adjust.n/zero.policy do R excluindo ilhas da etapa inferencial.
+mask_modelo = dengue["n_vizinhos"].gt(0).to_numpy()
+
+modelo = (
+    dengue.loc[mask_modelo]
+    .copy()
+    .reset_index()
+    .rename(columns={"index": "indice_original"})
+)
+
+w = Queen.from_dataframe(
+    modelo,
+    use_index=False,
+)
+
+w.transform = "R"
+
+
+# ------------------------------------------------------------
+# 3. Variáveis
+# ------------------------------------------------------------
+
+y = modelo["incidencia_100mil"].to_numpy(dtype=float)
+eventos = modelo["casos_provaveis"].to_numpy(dtype=float)
+pop = modelo["populacao"].to_numpy(dtype=float)
+
+if np.isnan(y).any():
+    raise ValueError(
+        "A incidência usada na análise contém NA."
+    )
+
+
+# ------------------------------------------------------------
+# 4. Moran Global da incidência bruta
+# ------------------------------------------------------------
+
+moran_global = Moran(
+    y,
+    w,
+    transformation="R",
+    permutations=999,
+    two_tailed=True,
+)
+
+print("\nMORAN GLOBAL — INCIDÊNCIA BRUTA")
+print(f"I = {moran_global.I:.6f}")
+print(f"E[I] = {moran_global.EI:.6f}")
+print(f"p_normal = {moran_global.p_norm:.6g}")
+print(f"p_permutacao = {moran_global.p_sim:.6g}")
+
+
+# ------------------------------------------------------------
+# 5. Moran para taxa casos/população
+# ------------------------------------------------------------
+# Moran_Rate aplica correção apropriada a uma variável do tipo taxa.
+
+moran_rate = Moran_Rate(
+    eventos,
+    pop,
+    w,
+    transformation="R",
+    permutations=999,
+    two_tailed=True,
+)
+
+print("\nMORAN RATE — CASOS / POPULAÇÃO")
+print(f"I = {moran_rate.I:.6f}")
+print(f"p_normal = {moran_rate.p_norm:.6g}")
+print(f"p_permutacao = {moran_rate.p_sim:.6g}")
+
+
+# ------------------------------------------------------------
+# 6. Moran com padronização de Assunção
+# ------------------------------------------------------------
+# assuncao_rate gera taxas padronizadas usando momentos de
+# estimativas Empirical Bayes, apropriadas para denominadores
+# populacionais heterogêneos.
+
+taxa_assuncao = assuncao_rate(
+    eventos,
+    pop,
+)
+
+moran_assuncao = Moran(
+    taxa_assuncao,
+    w,
+    transformation="R",
+    permutations=999,
+    two_tailed=True,
+)
+
+print("\nMORAN — TAXA PADRONIZADA DE ASSUNÇÃO")
+print(f"I = {moran_assuncao.I:.6f}")
+print(f"p_normal = {moran_assuncao.p_norm:.6g}")
+print(f"p_permutacao = {moran_assuncao.p_sim:.6g}")
+
+
+# ------------------------------------------------------------
+# 7. Suavização Bayesiana Empírica
+# ------------------------------------------------------------
+# 7.1 EB global (não espacial)
+eb_global = Empirical_Bayes(
+    dengue["casos_provaveis"].to_numpy(dtype=float),
+    dengue["populacao"].to_numpy(dtype=float),
+)
+
+dengue["incidencia_eb_global_100mil"] = (
+    np.asarray(eb_global.r).reshape(-1)
+    * 100_000
+)
+
+# 7.2 EB espacial/local
+# Spatial_Empirical_Bayes usa o próprio município + vizinhos.
+w_full.transform = "B"
+
+eb_espacial = Spatial_Empirical_Bayes(
+    dengue["casos_provaveis"].to_numpy(dtype=float),
+    dengue["populacao"].to_numpy(dtype=float),
+    w_full,
+)
+
+dengue["incidencia_eb_espacial_100mil"] = (
+    np.asarray(eb_espacial.r).reshape(-1)
+    * 100_000
+)
+
+dengue.loc[
+    ~np.isfinite(dengue["incidencia_eb_espacial_100mil"]),
+    "incidencia_eb_espacial_100mil",
+] = np.nan
+
+
+# ------------------------------------------------------------
+# 8. Moran Local / LISA
+# ------------------------------------------------------------
+
+z = (
+    y - np.mean(y)
+) / np.std(y, ddof=0)
+
+lag_z = lag_spatial(
+    w,
+    z,
+)
+
+lisa = Moran_Local(
+    z,
+    w,
+    transformation="R",
+    permutations=999,
+    geoda_quads=True,
+    seed=2025,
+    island_weight=0,
+)
+
+# PySAL fornece p_sim como pseudo-p unilateral.
+# Para comparação conservadora com uma decisão bilateral,
+# usamos 2*p, truncado em 1.
+p_lisa_2s = np.minimum(
+    1.0,
+    2.0 * np.asarray(lisa.p_sim),
+)
+
+# Correção FDR de Benjamini-Hochberg
+_, p_lisa_fdr, _, _ = multipletests(
+    p_lisa_2s,
+    alpha=0.05,
+    method="fdr_bh",
+)
+
+modelo["Ii"] = np.asarray(lisa.Is)
+modelo["p_lisa"] = p_lisa_2s
+modelo["p_lisa_fdr"] = p_lisa_fdr
+modelo["z_incidencia"] = z
+modelo["lag_z_incidencia"] = lag_z
+
+
+# ------------------------------------------------------------
+# 9. Classificação LISA
+# ------------------------------------------------------------
+
+def classificar_cluster(row) -> str:
+    if pd.isna(row["p_lisa_fdr"]) or row["p_lisa_fdr"] > 0.05:
+        return "Não significativo"
+
+    if (
+        row["z_incidencia"] > 0
+        and row["lag_z_incidencia"] > 0
+    ):
+        return "Alto-Alto"
+
+    if (
+        row["z_incidencia"] < 0
+        and row["lag_z_incidencia"] < 0
+    ):
+        return "Baixo-Baixo"
+
+    if (
+        row["z_incidencia"] > 0
+        and row["lag_z_incidencia"] < 0
+    ):
+        return "Alto-Baixo"
+
+    if (
+        row["z_incidencia"] < 0
+        and row["lag_z_incidencia"] > 0
+    ):
+        return "Baixo-Alto"
+
+    return "Não significativo"
+
+
+modelo["cluster_lisa"] = modelo.apply(
+    classificar_cluster,
+    axis=1,
+)
+
+# Devolver resultados LISA ao GeoDataFrame completo.
+dengue["Ii"] = np.nan
+dengue["p_lisa"] = np.nan
+dengue["p_lisa_fdr"] = np.nan
+dengue["z_incidencia"] = np.nan
+dengue["lag_z_incidencia"] = np.nan
+dengue["cluster_lisa"] = "Sem vizinhos"
+
+idx = modelo["indice_original"].to_numpy()
+
+for col in [
+    "Ii",
+    "p_lisa",
+    "p_lisa_fdr",
+    "z_incidencia",
+    "lag_z_incidencia",
+    "cluster_lisa",
+]:
+    dengue.loc[idx, col] = modelo[col].to_numpy()
+
+
+# ------------------------------------------------------------
+# 10. Resumo dos clusters
+# ------------------------------------------------------------
+
+resumo_clusters = (
+    dengue["cluster_lisa"]
+    .value_counts(dropna=False)
+    .rename_axis("cluster_lisa")
+    .reset_index(name="n_municipios")
+)
+
+resumo_clusters.to_csv(
+    DIR_RESULTADOS / "resumo_clusters_LISA.csv",
+    index=False,
+    encoding="utf-8-sig",
+)
+
+alto_alto = (
+    dengue.loc[
+        dengue["cluster_lisa"].eq("Alto-Alto")
+    ]
+    .drop(columns="geometry")
+    .sort_values(
+        "incidencia_100mil",
+        ascending=False,
+    )
+)
+
+alto_alto.to_csv(
+    DIR_RESULTADOS
+    / "municipios_cluster_alto_alto.csv",
+    index=False,
+    encoding="utf-8-sig",
+)
+
+
+# ------------------------------------------------------------
+# 11. Mapas
+# ------------------------------------------------------------
+# Não definimos paleta manual; Matplotlib/GeoPandas usa a
+# paleta padrão do ambiente.
+
+fig, ax = plt.subplots(figsize=(12, 9))
+dengue.plot(
+    column="incidencia_100mil",
+    legend=True,
+    linewidth=0,
+    ax=ax,
+)
+ax.set_title(
+    "Incidência de dengue por município — Brasil, 2025\n"
+    "Casos prováveis por 100 mil habitantes"
+)
+ax.set_axis_off()
+fig.tight_layout()
+fig.savefig(
+    DIR_FIGURAS / "mapa_incidencia_bruta_2025.png",
+    dpi=300,
+    bbox_inches="tight",
+)
+plt.close(fig)
+
+
+fig, ax = plt.subplots(figsize=(12, 9))
+dengue.plot(
+    column="incidencia_eb_espacial_100mil",
+    legend=True,
+    linewidth=0,
+    ax=ax,
+)
+ax.set_title(
+    "Incidência de dengue suavizada por Bayes Empírico Espacial\n"
+    "Brasil, 2025"
+)
+ax.set_axis_off()
+fig.tight_layout()
+fig.savefig(
+    DIR_FIGURAS
+    / "mapa_incidencia_bayes_empirico_2025.png",
+    dpi=300,
+    bbox_inches="tight",
+)
+plt.close(fig)
+
+
+fig, ax = plt.subplots(figsize=(12, 9))
+dengue.plot(
+    column="cluster_lisa",
+    categorical=True,
+    legend=True,
+    linewidth=0,
+    ax=ax,
+)
+ax.set_title(
+    "Clusters LISA da incidência de dengue — Brasil, 2025\n"
+    "999 permutações e correção FDR (Benjamini-Hochberg)"
+)
+ax.set_axis_off()
+fig.tight_layout()
+fig.savefig(
+    DIR_FIGURAS / "mapa_LISA_dengue_2025.png",
+    dpi=300,
+    bbox_inches="tight",
+)
+plt.close(fig)
+
+
+# ------------------------------------------------------------
+# 12. Exportar resultados
+# ------------------------------------------------------------
+
+tabular = pd.DataFrame(
+    dengue.drop(columns="geometry")
+)
+
+tabular.to_csv(
+    DIR_RESULTADOS
+    / "resultados_espaciais_dengue_2025.csv",
+    index=False,
+    encoding="utf-8-sig",
+)
+
+dengue.to_parquet(
+    DIR_RESULTADOS
+    / "resultados_espaciais_dengue_2025.parquet",
+    index=False,
+)
+
+dengue.to_file(
+    DIR_RESULTADOS
+    / "resultados_espaciais_dengue_2025.gpkg",
+    layer="dengue_espacial_2025",
+    driver="GPKG",
+)
+
+
+# ------------------------------------------------------------
+# 13. Relatório estatístico
+# ------------------------------------------------------------
+
+linhas = [
+    "ANÁLISE ESTATÍSTICA ESPACIAL DA DENGUE — BRASIL, 2025",
+    "=" * 61,
+    "",
+    f"Municípios na base: {len(dengue)}",
+    f"Municípios na análise inferencial: {len(modelo)}",
+    f"Número médio de vizinhos (base completa): {n_vizinhos.mean():.3f}",
+    f"Municípios sem vizinhos: {len(islands)}",
+    f"Componentes espaciais: {w_full.n_components}",
+    "",
+    "MORAN GLOBAL — INCIDÊNCIA BRUTA",
+    f"I = {moran_global.I:.8f}",
+    f"E[I] = {moran_global.EI:.8f}",
+    f"p_normal = {moran_global.p_norm:.8g}",
+    f"p_permutacao = {moran_global.p_sim:.8g}",
+    "",
+    "MORAN RATE — CASOS / POPULAÇÃO",
+    f"I = {moran_rate.I:.8f}",
+    f"p_normal = {moran_rate.p_norm:.8g}",
+    f"p_permutacao = {moran_rate.p_sim:.8g}",
+    "",
+    "MORAN — PADRONIZAÇÃO DE ASSUNÇÃO",
+    f"I = {moran_assuncao.I:.8f}",
+    f"p_normal = {moran_assuncao.p_norm:.8g}",
+    f"p_permutacao = {moran_assuncao.p_sim:.8g}",
+    "",
+    "CLUSTERS LISA",
+    resumo_clusters.to_string(index=False),
+]
+
+(
+    DIR_RESULTADOS
+    / "relatorio_estatistica_espacial_2025.txt"
+).write_text(
+    "\n".join(linhas),
+    encoding="utf-8",
+)
+
+
+# ------------------------------------------------------------
+# 14. Resumo no console
+# ------------------------------------------------------------
+
+print("\n" + "=" * 64)
+print("ANÁLISE ESPACIAL CONCLUÍDA")
+print("=" * 64)
+print(f"Municípios na base: {len(dengue):,}")
+print(
+    "Municípios usados na inferência: "
+    f"{len(modelo):,}"
+)
+print(
+    "Municípios sem vizinhos Queen: "
+    f"{len(islands):,}"
+)
+print(f"Componentes espaciais: {w_full.n_components}")
+print(
+    "Moran bruto: "
+    f"I={moran_global.I:.5f}; "
+    f"p_perm={moran_global.p_sim:.5g}"
+)
+print(
+    "Moran Rate: "
+    f"I={moran_rate.I:.5f}; "
+    f"p_perm={moran_rate.p_sim:.5g}"
+)
+print(
+    "Moran Assunção: "
+    f"I={moran_assuncao.I:.5f}; "
+    f"p_perm={moran_assuncao.p_sim:.5g}"
+)
+print("=" * 64)
+print("Resultados salvos em /resultados e /figuras.")
